@@ -2,3 +2,5 @@ PyYAML
 progress
 requests
 maixtool
+tqdm
+rich

@@ -19,6 +19,10 @@ import zipfile
 import lzma
 import json
 
+from rich import print
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+
 sdk_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 lock = Lock()
@@ -58,138 +62,65 @@ def check_sha256sum(file, sum):
         sha256sum=hashlib.sha256(f.read()).hexdigest()
     return sha256sum == sum, sha256sum
 
-class DownloaderThread(threading.Thread):
-    def __init__(self, url, fd, range: tuple, callback, headers):
-        threading.Thread.__init__(self)
-        self.callback = callback
-        self.url = url
-        self.fd = fd
-        self.range = range
-        self.headers = headers
-
-    def run(self):
-        headers = {
-            "Range":"bytes=%s-%s" %(self.range[0], self.range[1] - 1)
-        }
-        headers.update(self.headers)
-        # print(f"-- download range [{self.range[0]} - {self.range[1]})")
-        res = requests.get(self.url, headers=headers)
-        if res.status_code != 206:
-            raise Exception("download file error, download not support range download")
-        lock.acquire()
-        self.fd.seek(self.range[0])
-        self.fd.write(res.content)
-        self.fd.flush()
-        lock.release()
-        # print(f"-- download range [{self.range[0]} - {self.range[1]}) complete")
-        self.callback(self.range)
-
 class Downloader:
-    def __init__(self, url, save_path, max_thead_num = 8, callback=None, force_write=False, progress_bar = True, headers = {}):
-        self.progress_bar = progress_bar
+    def __init__(self, url, save_path, max_thread_num=8, force_write=False, headers={}):
         self.url = url
-        self.max_thead_num = max_thead_num
-        self.headers = headers
         self.save_path = os.path.abspath(os.path.expanduser(save_path))
-        name = os.path.basename(self.save_path)
-        temp_name = ".{}.temp".format(name)
-        self.temp_path = os.path.join(os.path.dirname(self.save_path), temp_name)
+        self.max_thread_num = max_thread_num
+        self.headers = headers
+        self.force_write = force_write
+        self.setup_download()
+
+    def setup_download(self):
         os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-        self.callback = callback
-        self.data_content = None
+        self.temp_path = self.save_path + ".temp"
+        with requests.head(self.url, headers=self.headers) as res:
+            if res.status_code == 302:
+                self.url = res.headers['Location']
+                return self.setup_download()
+            if res.status_code != 200:
+                raise Exception("Failed to prepare download. Status code: {}, Content: {}".format(res.status_code, res.text))
+            self.total = int(res.headers.get('Content-Length', 0))
+
+    def download_chunk(self, start, end):
         headers = self.headers.copy()
-        res = requests.head(self.url, headers=headers)
-        # 302 redirect
-        if res.status_code == 302:
-            self.url = res.headers['Location']
-            res = requests.head(self.url, headers=headers)
-        if res.status_code != 200:
-            raise  Exception("download file error, code: {}, content: {}".format(res.status_code, res.content.decode()))
-        headers["Range"] = "bytes=0-1"
-        print("-- get content-length failed, try directly download, it may be slow")
-        res = requests.get(self.url, headers=headers)
-        try:
-            if not 'Content-Length' in res.headers:
-                print("-- [WARNING] get content-length failed, will just download")
-                if res.status_code == 200:
-                    self.data_content = res.content
-                    print("-- download file size: {}".format(bytes2human(len(self.data_content))))
-            else:
-                self.total = int(res.headers['Content-Length'])
-                if res.status_code != 206:
-                    if len(res.content) != self.total:
-                        raise Exception("download file error, download length:{}, but content length is {}".format(len(res.content), self.total))
-                    self.data_content = res.content
-                    print("-- download complete, file size: {}".format(bytes2human(self.total)))
-        except Exception as e:
-            print("-- download failed, return headers: {}".format(res.headers))
-            raise e
-        self.downloaded = 0
-        if not self.data_content:
-            if self.total <= 0:
-                raise  Exception("file size error")
-            # update max_thread_num for short file
-            if self.total < 1024 * self.max_thead_num:
-                self.max_thead_num = self.total // 1024 + (1 if self.total % 1024 != 0 else 0)
-            if self.progress_bar:
-                print("-- Download file size: {}".format(bytes2human(self.total)))
-        if os.path.exists(self.save_path) and not force_write:
-            raise Exception("file already exists")
-        dir_path = os.path.dirname(save_path)
-        if not os.path.exists(dir_path):
-            os.makedirs(dir_path)
-            # self.bar = Bar("Downloading", max = self.total,  suffix='%(percent)d%% - %(index)d/%(max)d - %(eta)ds')
-            # self.bar.next(0)
+        headers['Range'] = 'bytes={}-{}'.format(start, end)
+        response = requests.get(self.url, headers=headers)
+        if response.status_code not in [200, 206]:
+            raise Exception("Failed to download chunk. Status code: {}".format(response.status_code))
+        return response.content
 
-    def __chunks(self):
-        start = 0
-        self.chunk_size = self.total//self.max_thead_num
-        for i in range(self.max_thead_num):
-            if i == self.max_thead_num - 1: # last chunk
-                last_chunk_size = self.total - self.chunk_size * i
-                yield (start, start + last_chunk_size)
-            else:
-                yield (start, start + self.chunk_size)
-            start += self.chunk_size
-
-    def on_done(self, d_range):
-        if self.progress_bar:
-            self.downloaded += d_range[1] - d_range[0]
-            print("-- Download {}% ({}/{})".format(self.downloaded * 100 // self.total, bytes2human(self.downloaded), bytes2human(self.total)))
-            # self.bar.next(d_range[1] - d_range[0])
+    def combine_files(self):
+        with open(self.temp_path, 'wb') as fw:
+            for i in range(self.max_thread_num):
+                part_path = f"{self.temp_path}.part{i}"
+                with open(part_path, 'rb') as fr:
+                    fw.write(fr.read())
+                os.remove(part_path)
 
     def start(self):
-        with open(self.temp_path, "wb"):
-            pass
-        if self.data_content:
-            with open(self.temp_path, "ab") as f:
-                f.write(self.data_content)
-        else:
-            fds = []
-            ths = []
-            with open(self.temp_path, "rb+") as fd_w:
-                for d_range in self.__chunks():
-                    # create new fd for multiple thread
-                    dup_fno = os.dup(fd_w.fileno())
-                    fd = os.fdopen(dup_fno,'rb+', -1)
-                    fds.append(fd)
-                    # create new thread
-                    th = DownloaderThread(self.url, fd, d_range, self.on_done, self.headers)
-                    th.daemon = True
-                    th.start()
-                    ths.append(th)
-                # wait for all thread exit
-                for th in ths:
-                    th.join()
-                for fd in fds:
-                    fd.close()
-        # delete old file
-        if os.path.exists(self.save_path):
-            os.remove(self.save_path)
-        # rename
+        if os.path.exists(self.save_path) and not self.force_write:
+            raise Exception("File already exists.")
+        
+        chunk_size = self.total // self.max_thread_num
+        futures = []
+        with ThreadPoolExecutor(max_workers=self.max_thread_num) as executor, tqdm(total=self.total, unit='B', unit_scale=True, desc="Downloading") as progress:
+            for i in range(self.max_thread_num):
+                start = i * chunk_size
+                end = start + chunk_size - 1 if i != self.max_thread_num - 1 else self.total
+                futures.append(executor.submit(self.download_chunk, start, end))
+        
+            # Save chunks to temp files and update progress bar
+            for i, future in enumerate(futures):
+                part_path = f"{self.temp_path}.part{i}"
+                content = future.result()
+                with open(part_path, 'wb') as f:
+                    f.write(content)
+                    progress.update(len(content))
+
+        self.combine_files()
         os.rename(self.temp_path, self.save_path)
-        if self.progress_bar:
-            print("")
+        print("Download completed.")
 
 def check_download_items(items):
     keys = ["url", "sha256sum", "path"]
@@ -255,13 +186,13 @@ def download_extract_files(items):
             }
             if "user-agent" in item:
                 headers["User-Agent"] = item["user-agent"]
-            d = Downloader(item["url"], pkg_path, max_thead_num = 8, force_write=True, headers=headers)
+            d = Downloader(item["url"], pkg_path, max_thread_num = 8, force_write=True, headers=headers)
             d.start()
             # check sha256sum
             if "sha256sum" in item and item["sha256sum"]:
                 ok, sha256sum = check_sha256sum(pkg_path, item["sha256sum"])
                 if not ok:
-                    print("-- Error: sha256sum check failed, shoule be {}, but files's sha256sum is {}.\n   Please download this file manually".format(item["sha256sum"], sha256sum))
+                    print("-- Error: file {} sha256sum check failed, shoule be {}, but files's sha256sum is {}.\n   Please download this file manually".format(pkg_path, item["sha256sum"], sha256sum))
                     sys.exit(1)
         # extract_dir not empty means already extracted, continue
         need_extract = False

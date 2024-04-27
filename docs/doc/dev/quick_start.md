@@ -28,7 +28,7 @@ git clone https://github.com/Sipeed/MaixCDK
 
 * 安装依赖
 
-```
+```shell
 cd MaixCDK
 pip install -U pip                     # 更新 pip 到最新版本
 pip install -U -r requirements.txt     # 安装依赖
@@ -42,7 +42,7 @@ pip install -U -r requirements.txt     # 安装依赖
 * 编译
 
 ```shell
-cd projects/hello_world
+cd examples/hello_world
 maixcdk menuconfig
 ```
 然后在选项`Platform`中选择你的设备名，然后按`ESC`按键，再按`Y`保存退出。
